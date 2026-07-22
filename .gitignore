@@ -1,0 +1,6 @@
+output/
+grib2/
+wgrib2.tgz
+*.grib2
+.rrfs_tmp_*
+.DS_Store
