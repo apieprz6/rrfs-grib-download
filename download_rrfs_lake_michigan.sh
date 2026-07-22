@@ -13,7 +13,7 @@ LON_E=$((360 - 85))   # 85.5W ~ 275
 LAT_S="41.6"
 LAT_N="46.1"
 
-IDX_MATCH=":(UGRD:10 m above ground|VGRD:10 m above ground|GUST:surface|MSLET:mean sea level):"
+IDX_MATCH=":(UGRD:10 m above ground|VGRD:10 m above ground|GUST:surface|MSLET:mean sea level|APCP:surface):"
 
 HTTPS_BASE="https://${BUCKET}.s3.amazonaws.com"
 MAX_PARALLEL=20
@@ -222,5 +222,5 @@ echo "Done. Output: ${output_file}"
 echo "  Cycle: ${found_date} ${found_hour}z"
 echo "  Subhour (15-min): f001-f018 (72 time steps)"
 echo "  Hourly: f000, f019-f084 (67 time steps)"
-echo "  Variables: UGRD 10m, VGRD 10m, GUST, MSLET"
+echo "  Variables: UGRD 10m, VGRD 10m, GUST, MSLET, APCP"
 echo "  Region: Lake Michigan (${LAT_S}-${LAT_N}N, $((360 - LON_E))-$((360 - LON_W))W)"

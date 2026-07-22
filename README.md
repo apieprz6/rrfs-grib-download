@@ -27,6 +27,7 @@ Downloads a shorter forecast from the latest complete cycle (any 3-hourly cycle)
 | VGRD 10m | V-component of wind at 10m above ground |
 | GUST | Wind gust at surface |
 | MSLET | Mean sea level pressure (Eta reduction) |
+| APCP | Accumulated precipitation at surface |
 
 ### Region
 
