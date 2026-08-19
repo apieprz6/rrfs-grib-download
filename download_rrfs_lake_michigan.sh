@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BUCKET="noaa-rrfs-pds"
-PREFIX="rrfs_a"
+NOMADS_BASE="https://nomads.ncep.noaa.gov/pub/data/nccf/com/rrfs"
+if [[ $(date -u +%Y%m%d) -ge 20261006 ]]; then
+    NOMADS_BASE="${NOMADS_BASE}/prod"
+else
+    NOMADS_BASE="${NOMADS_BASE}/para"
+fi
 PRODUCT="2dfld"
 DOMAIN="conus"
 RESOLUTION="3km"
@@ -15,7 +19,6 @@ LAT_N="46.1"
 
 IDX_MATCH=":(UGRD:10 m above ground|VGRD:10 m above ground|GUST:surface|MSLET:mean sea level|APCP:surface):"
 
-HTTPS_BASE="https://${BUCKET}.s3.amazonaws.com"
 MAX_PARALLEL=20
 
 OUTDIR="$(pwd)/output"
@@ -35,7 +38,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Dependency checks ---
-for cmd in wgrib2 aws curl; do
+for cmd in wgrib2 curl; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: '$cmd' is required but not found in PATH." >&2
         exit 1
@@ -68,14 +71,14 @@ for offset in $(seq 0 48); do
         continue
     fi
 
-    # Check both: subhour f018 and regular f084 must exist
-    subh_final="${PREFIX}/rrfs.${check_date}/${check_hour}/rrfs.t${check_hour}z.${PRODUCT}.${RESOLUTION}.subh.f$(printf '%03d' $SUBH_MAX_HOUR).${DOMAIN}.grib2"
-    reg_final="${PREFIX}/rrfs.${check_date}/${check_hour}/rrfs.t${check_hour}z.${PRODUCT}.${RESOLUTION}.f$(printf '%03d' $MAIN_MAX_HOUR).${DOMAIN}.grib2"
+    # Check both: subhour f018 and regular f084 must exist via HTTP HEAD
+    subh_final_url="${NOMADS_BASE}/rrfs.${check_date}/${check_hour}/rrfs.t${check_hour}z.${PRODUCT}.${RESOLUTION}.subh.f$(printf '%03d' $SUBH_MAX_HOUR).${DOMAIN}.grib2"
+    reg_final_url="${NOMADS_BASE}/rrfs.${check_date}/${check_hour}/rrfs.t${check_hour}z.${PRODUCT}.${RESOLUTION}.f$(printf '%03d' $MAIN_MAX_HOUR).${DOMAIN}.grib2"
 
     echo "  Checking cycle ${check_date}/${check_hour}z..."
 
-    if aws s3 ls "s3://${BUCKET}/${subh_final}" --no-sign-request &>/dev/null && \
-       aws s3 ls "s3://${BUCKET}/${reg_final}" --no-sign-request &>/dev/null; then
+    if curl --http1.1 -sf --head "$subh_final_url" &>/dev/null && \
+       curl --http1.1 -sf --head "$reg_final_url" &>/dev/null; then
         found_cycle="${check_date}/${check_hour}"
         found_date="$check_date"
         found_hour="$check_hour"
@@ -121,7 +124,7 @@ local_raw="\${TMPDIR_BASE}/raw_\${out_prefix}.grib2"
 local_filtered="\${TMPDIR_BASE}/filt_\${out_prefix}.grib2"
 
 # Fetch the idx file
-idx_content=\$(curl -sf "\$idx_url") || { echo "  WARNING: Failed to fetch idx for \${out_prefix}" >&2; exit 1; }
+idx_content=\$(curl --http1.1 -sf "\$idx_url") || { echo "  WARNING: Failed to fetch idx for \${out_prefix}" >&2; exit 1; }
 
 # Parse idx to find byte ranges for our variables
 prev_offset=""
@@ -155,7 +158,7 @@ fi
 # Download each byte range and concatenate
 > "\$local_raw"
 for r in "\${offsets[@]}"; do
-    if ! curl -sf -H "Range: bytes=\${r}" "\$file_url" >> "\$local_raw"; then
+    if ! curl --http1.1 -sf -H "Range: bytes=\${r}" "\$file_url" >> "\$local_raw"; then
         echo "  WARNING: Failed to download range \${r} for \${out_prefix}" >&2
         rm -f "\$local_raw"
         exit 1
@@ -180,14 +183,14 @@ echo "  Phase 3: f019-f084 (regular hourly)"
 echo "  Using byte-range downloads with ${MAX_PARALLEL} parallel jobs..."
 
 # Phase 1: f000 from regular product
-file_url="${HTTPS_BASE}/${PREFIX}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.f000.${DOMAIN}.grib2"
+file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.f000.${DOMAIN}.grib2"
 "$WORKER" "$file_url" "000_reg_f000"
 
 # Phase 2: f001-f018 from subhour product (parallel)
 for i in $(seq 1 "$SUBH_MAX_HOUR"); do
     fhr_str=$(printf "f%03d" "$i")
     seq_num=$(printf "%03d" "$i")
-    file_url="${HTTPS_BASE}/${PREFIX}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.subh.${fhr_str}.${DOMAIN}.grib2"
+    file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.subh.${fhr_str}.${DOMAIN}.grib2"
     echo "${file_url} ${seq_num}_subh_${fhr_str}"
 done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER"
 
@@ -195,7 +198,7 @@ done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER"
 for i in $(seq 19 "$MAIN_MAX_HOUR"); do
     fhr_str=$(printf "f%03d" "$i")
     seq_num=$(printf "%03d" "$i")
-    file_url="${HTTPS_BASE}/${PREFIX}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.${fhr_str}.${DOMAIN}.grib2"
+    file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.${fhr_str}.${DOMAIN}.grib2"
     echo "${file_url} ${seq_num}_reg_${fhr_str}"
 done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER"
 
