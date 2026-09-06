@@ -1,6 +1,12 @@
 # RRFS GRIB Download
 
-Scripts for downloading RRFS (Rapid Refresh Forecast System) weather data from the NOAA S3 bucket, filtered and cropped to the Lake Michigan region.
+Scripts for downloading RRFS (Rapid Refresh Forecast System) weather data from NOAA NOMADS, filtered and cropped to the Lake Michigan region.
+
+## Data source
+
+Data comes from NOMADS at `https://nomads.ncep.noaa.gov/pub/data/nccf/com/rrfs`, using the `2dfld` product on the 3 km CONUS grid.
+
+RRFS is still in parallel testing, so the scripts pick the directory by date: `para` before **2026-10-06** and `prod` from that date onward. Adjust the cutover date at the top of each script if NOAA's schedule shifts.
 
 ## Scripts
 
@@ -14,10 +20,11 @@ Downloads the full forecast from the latest complete **main cycle** (00z, 06z, 1
 
 ### `download_rrfs_hourly_lake_michigan.sh`
 
-Downloads a shorter forecast from the latest complete cycle (any 3-hourly cycle):
+Downloads a shorter forecast from the latest complete cycle. RRFS runs hourly, so this picks up **any** cycle hour, not just the main four — it updates far more often than the full script.
 
-- **f000**: Analysis hour (regular product)
 - **f001-f018**: Sub-hourly (15-minute resolution, 72 time steps)
+
+Note this script does *not* include f000; it starts at f001.
 
 ### Variables downloaded
 
@@ -29,6 +36,8 @@ Downloads a shorter forecast from the latest complete cycle (any 3-hourly cycle)
 | MSLET | Mean sea level pressure (Eta reduction) |
 | APCP | Accumulated precipitation at surface |
 
+Two APCP caveats when counting messages: the regular (non-subhourly) files carry **two** APCP records per forecast hour — a 1-hour bucket and a run-total — while f000 carries **none**, since nothing has accumulated at analysis time.
+
 ### Region
 
 Lake Michigan bounding box:
@@ -38,13 +47,14 @@ Lake Michigan bounding box:
 ## Dependencies
 
 - **wgrib2** - GRIB2 file manipulation (see installation below)
-- **AWS CLI** - for checking S3 bucket availability (`aws s3 ls --no-sign-request`)
 - **curl** - for byte-range HTTP downloads
 
-Install AWS CLI and curl via Homebrew:
+These are the only two the scripts check for. No AWS CLI is needed — the scripts read from NOMADS over plain HTTP.
+
+curl ships with macOS. If you want a newer build:
 
 ```bash
-brew install awscli curl
+brew install curl
 ```
 
 ## Installing wgrib2 on macOS (Apple Silicon)
@@ -127,7 +137,7 @@ wgrib2 --version
 # Full 84-hour forecast (main cycles only)
 ./download_rrfs_lake_michigan.sh
 
-# Short 18-hour forecast (any 3-hourly cycle, more frequent updates)
+# Short 18-hour forecast (any hourly cycle, more frequent updates)
 ./download_rrfs_hourly_lake_michigan.sh
 ```
 
@@ -139,19 +149,48 @@ output/rrfs_hourly_lake_michigan_20260722_15z.grib2
 ```
 
 The scripts:
-1. Find the latest complete forecast cycle on the NOAA S3 bucket
-2. Download only the matching variable byte ranges (not full files) using index files
-3. Crop each forecast hour to the Lake Michigan bounding box
-4. Merge all hours into a single output GRIB2 file
+1. Find the latest complete forecast cycle on NOMADS
+2. Read each forecast hour's `.idx` file to locate the byte ranges for the variables above
+3. Fetch all of those ranges in a **single** multi-range HTTP request per forecast hour
+4. Crop each forecast hour to the Lake Michigan bounding box
+5. Merge all hours into a single output GRIB2 file
 
-Downloads run with up to 20 parallel jobs for speed.
+Step 3 matters for staying under NOMADS' rate limits. NOMADS' Apache honors multi-range requests and answers with `multipart/byteranges`; wgrib2 scans for the `GRIB` magic bytes, so it skips the MIME boundaries and the response can be handed to it as-is. That makes a run cost two requests per forecast hour (one `.idx`, one data) instead of one request per variable — 36 requests for the hourly script and 170 for the full one.
+
+Downloads run with 4 parallel jobs. Higher parallelism gains little now that each hour is only two requests, and it risks tripping NOMADS' throttle.
+
+### If a run fails
+
+NOMADS throttles clients that request too aggressively, and a throttled response can arrive as an HTTP 200 with an empty body. The scripts guard against this: every fetch has timeouts and retries with backoff, idx bodies are validated before use, and each download is checked for the number of GRIB messages the idx asked for.
+
+If forecast hours still fail, the script says so rather than exiting quietly, and reports the count it actually merged:
+
+```
+WARNING: only 82 of 85 forecast hours succeeded.
+         Output will have gaps. Re-run to fill them.
+```
+
+A completed run prints `85 of 85 forecast hours`. Check that line — output with gaps is still a valid GRIB2 file and will not otherwise announce itself. If you see a shortfall, delete the output file and re-run.
 
 ## Inspecting output
 
+Pass one file at a time. wgrib2 takes a single input file and aborts with `FATAL ERROR: too many grib files` if a glob expands to more than one, which it will as soon as `output/` holds a second run:
+
 ```bash
+F=output/rrfs_lake_michigan_20260904_12z.grib2
+
 # List all messages in the output file
-wgrib2 output/rrfs_lake_michigan_*.grib2
+wgrib2 "$F"
 
 # Extract a CSV of wind gust values
-wgrib2 output/rrfs_lake_michigan_*.grib2 -match ':GUST:' -csv gust.csv
+wgrib2 "$F" -match ':GUST:' -csv gust.csv
+
+# Confirm the file is complete: 760 for the full script, 360 for the hourly one
+wgrib2 "$F" | grep -c ':d='
+
+# Per-variable breakdown (full script: 139 each of GUST/MSLET/UGRD/VGRD, 204 APCP)
+wgrib2 "$F" | awk -F: '{print $4}' | sort | uniq -c
+
+# Verify the crop actually applied -- expect Lambert Conformal 100 x 176
+wgrib2 -grid "$F" | head -3
 ```

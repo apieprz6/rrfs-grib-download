@@ -19,7 +19,14 @@ LAT_N="46.1"
 
 IDX_MATCH=":(UGRD:10 m above ground|VGRD:10 m above ground|GUST:surface|MSLET:mean sea level|APCP:surface):"
 
-MAX_PARALLEL=20
+# NOMADS throttles aggressive clients. Each forecast hour costs exactly two
+# requests (one .idx + one multi-range fetch), so a low parallelism is plenty.
+MAX_PARALLEL=4
+
+# Shared curl options: bounded waits so a throttled connection can never hang
+# the script, plus retry with backoff for transient 5xx/reset responses.
+CURL_OPTS=(--http1.1 -sf --connect-timeout 15 --max-time 600
+           --retry 5 --retry-delay 3 --retry-all-errors)
 
 OUTDIR="$(pwd)/output"
 TMPDIR_BASE="${OUTDIR}/.rrfs_tmp_$$"
@@ -77,8 +84,8 @@ for offset in $(seq 0 48); do
 
     echo "  Checking cycle ${check_date}/${check_hour}z..."
 
-    if curl --http1.1 -sf --head "$subh_final_url" &>/dev/null && \
-       curl --http1.1 -sf --head "$reg_final_url" &>/dev/null; then
+    if curl --http1.1 -sf --connect-timeout 15 --max-time 30 --head "$subh_final_url" &>/dev/null && \
+       curl --http1.1 -sf --connect-timeout 15 --max-time 30 --head "$reg_final_url" &>/dev/null; then
         found_cycle="${check_date}/${check_hour}"
         found_date="$check_date"
         found_hour="$check_hour"
@@ -118,13 +125,33 @@ LON_W="${LON_W}"
 LON_E="${LON_E}"
 LAT_S="${LAT_S}"
 LAT_N="${LAT_N}"
+# KEEP IN SYNC with CURL_OPTS at the top of the parent script. Spelled out
+# literally rather than interpolated: bash 3.2 (the macOS default) silently
+# drops the quoting from \${array[@]@Q}.
+CURL_OPTS=(--http1.1 -sf --connect-timeout 15 --max-time 600
+           --retry 5 --retry-delay 3 --retry-all-errors)
 
 idx_url="\${file_url}.idx"
 local_raw="\${TMPDIR_BASE}/raw_\${out_prefix}.grib2"
 local_filtered="\${TMPDIR_BASE}/filt_\${out_prefix}.grib2"
 
-# Fetch the idx file
-idx_content=\$(curl --http1.1 -sf "\$idx_url") || { echo "  WARNING: Failed to fetch idx for \${out_prefix}" >&2; exit 1; }
+# Fetch the idx file. A throttled NOMADS can answer 200 with a truncated or
+# empty body, which curl's own retry logic will not catch -- so validate that
+# the payload actually parses as an idx and retry with backoff if it does not.
+idx_content=""
+for attempt in 1 2 3 4 5; do
+    idx_content=\$(curl "\${CURL_OPTS[@]}" "\$idx_url" || true)
+    if grep -qE '^[0-9]+:[0-9]+:d=' <<< "\$idx_content"; then
+        break
+    fi
+    idx_content=""
+    sleep \$((attempt * 3))
+done
+
+if [[ -z "\$idx_content" ]]; then
+    echo "  WARNING: Failed to fetch a valid idx for \${out_prefix}" >&2
+    exit 1
+fi
 
 # Parse idx to find byte ranges for our variables
 prev_offset=""
@@ -155,15 +182,26 @@ if (( \${#offsets[@]} == 0 )); then
     exit 1
 fi
 
-# Download each byte range and concatenate
-> "\$local_raw"
-for r in "\${offsets[@]}"; do
-    if ! curl --http1.1 -sf -H "Range: bytes=\${r}" "\$file_url" >> "\$local_raw"; then
-        echo "  WARNING: Failed to download range \${r} for \${out_prefix}" >&2
-        rm -f "\$local_raw"
-        exit 1
-    fi
-done
+# Fetch every range in ONE request. Apache answers with multipart/byteranges;
+# wgrib2 scans for the GRIB magic and skips the MIME boundaries, so the body
+# can be handed to it as-is. This is 1 request per forecast hour instead of one
+# per variable -- the difference between ~780 and ~170 requests per run, which is
+# what was tripping NOMADS' rate limiter.
+range_header=\$(IFS=,; echo "\${offsets[*]}")
+
+if ! curl "\${CURL_OPTS[@]}" -H "Range: bytes=\${range_header}" "\$file_url" -o "\$local_raw"; then
+    echo "  WARNING: Failed to download ranges for \${out_prefix}" >&2
+    rm -f "\$local_raw"
+    exit 1
+fi
+
+# Guard against a throttled 200/206 that returns fewer messages than requested.
+got=\$(wgrib2 "\$local_raw" 2>/dev/null | grep -c ':d=' || true)
+if (( got != \${#offsets[@]} )); then
+    echo "  WARNING: \${out_prefix} returned \${got} of \${#offsets[@]} messages" >&2
+    rm -f "\$local_raw"
+    exit 1
+fi
 
 # Crop to Lake Michigan bounding box
 if ! wgrib2 "\$local_raw" -small_grib "\${LON_W}:\${LON_E}" "\${LAT_S}:\${LAT_N}" "\$local_filtered" >/dev/null 2>&1; then
@@ -182,9 +220,10 @@ echo "  Phase 2: f001-f018 (subhour, 15-min resolution)"
 echo "  Phase 3: f019-f084 (regular hourly)"
 echo "  Using byte-range downloads with ${MAX_PARALLEL} parallel jobs..."
 
-# Phase 1: f000 from regular product
+# Phase 1: f000 from regular product. Don't let one bad hour abort the run.
+failed=0
 file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.f000.${DOMAIN}.grib2"
-"$WORKER" "$file_url" "000_reg_f000"
+"$WORKER" "$file_url" "000_reg_f000" || failed=1
 
 # Phase 2: f001-f018 from subhour product (parallel)
 for i in $(seq 1 "$SUBH_MAX_HOUR"); do
@@ -192,7 +231,7 @@ for i in $(seq 1 "$SUBH_MAX_HOUR"); do
     seq_num=$(printf "%03d" "$i")
     file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.subh.${fhr_str}.${DOMAIN}.grib2"
     echo "${file_url} ${seq_num}_subh_${fhr_str}"
-done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER"
+done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER" || failed=1
 
 # Phase 3: f019-f084 from regular product (parallel)
 for i in $(seq 19 "$MAIN_MAX_HOUR"); do
@@ -200,7 +239,13 @@ for i in $(seq 19 "$MAIN_MAX_HOUR"); do
     seq_num=$(printf "%03d" "$i")
     file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.${fhr_str}.${DOMAIN}.grib2"
     echo "${file_url} ${seq_num}_reg_${fhr_str}"
-done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER"
+done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER" || failed=1
+
+# xargs exits 123 when any worker failed. Don't let `set -e` abort here -- report
+# the shortfall below and still merge whatever did succeed.
+if (( failed )); then
+    echo "  NOTE: one or more forecast hours failed (see warnings above)."
+fi
 
 echo "  Downloads complete."
 
@@ -216,6 +261,12 @@ if (( ${#filtered_files[@]} == 0 )); then
     exit 1
 fi
 
+expected_files=$(( 1 + SUBH_MAX_HOUR + (MAIN_MAX_HOUR - 19 + 1) ))
+if (( ${#filtered_files[@]} < expected_files )); then
+    echo "  WARNING: only ${#filtered_files[@]} of ${expected_files} forecast hours succeeded." >&2
+    echo "           Output will have gaps. Re-run to fill them." >&2
+fi
+
 # Sort to ensure proper ordering (000_reg_f000, 001_subh_f001..018_subh_f018, 019_reg_f019..084_reg_f084)
 IFS=$'\n' sorted_files=($(printf '%s\n' "${filtered_files[@]}" | sort)); unset IFS
 
@@ -223,7 +274,7 @@ cat "${sorted_files[@]}" > "$output_file"
 
 echo "Done. Output: ${output_file}"
 echo "  Cycle: ${found_date} ${found_hour}z"
-echo "  Subhour (15-min): f001-f018 (72 time steps)"
-echo "  Hourly: f000, f019-f084 (67 time steps)"
+echo "  Forecast hours: ${#filtered_files[@]} of ${expected_files} ($(wgrib2 "$output_file" 2>/dev/null | grep -c ':d=' || echo '?') messages)"
+echo "  Subhour (15-min): f001-f018 | Hourly: f000, f019-f084"
 echo "  Variables: UGRD 10m, VGRD 10m, GUST, MSLET, APCP"
 echo "  Region: Lake Michigan (${LAT_S}-${LAT_N}N, $((360 - LON_E))-$((360 - LON_W))W)"
