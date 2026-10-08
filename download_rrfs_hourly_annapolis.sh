@@ -11,11 +11,15 @@ PRODUCT="2dfld"
 DOMAIN="conus"
 RESOLUTION="3km"
 
-# Lake Michigan bounding box (lon must be 0-360 for wgrib2 -small_grib)
-LON_W=$((360 - 88))   # 87.8W ~ 272
-LON_E=$((360 - 85))   # 85.5W ~ 275
-LAT_S="41.6"
-LAT_N="46.1"
+# Annapolis race area bounding box (lon must be 0-360 for wgrib2 -small_grib)
+# Covers the AYC Bay Circle (off the Severn River mouth), the Inside Circle off
+# Chesapeake Harbor, and every Region 3 government mark in SI Attachment 3
+# (K 38.75N to D 38.99N, F 76.32W to T/Y 76.47W), padded ~10 km so the 3 km
+# grid has context around the course.
+LON_W="283.35"   # 76.65W
+LON_E="283.85"   # 76.15W
+LAT_S="38.6"
+LAT_N="39.1"
 
 IDX_MATCH=":(UGRD:10 m above ground|VGRD:10 m above ground|GUST:surface|MSLET:mean sea level|APCP:surface):"
 
@@ -83,7 +87,7 @@ if [[ -z "$found_cycle" ]]; then
 fi
 
 # --- Download, filter, and crop ---
-output_file="${OUTDIR}/rrfs_hourly_lake_michigan_${found_date}_${found_hour}z.grib2"
+output_file="${OUTDIR}/rrfs_hourly_annapolis_${found_date}_${found_hour}z.grib2"
 
 if [[ -f "$output_file" ]]; then
     echo "Output file already exists: ${output_file}"
@@ -186,7 +190,7 @@ if (( got != \${#offsets[@]} )); then
     exit 1
 fi
 
-# Crop to Lake Michigan bounding box
+# Crop to Annapolis race area bounding box
 if ! wgrib2 "\$local_raw" -small_grib "\${LON_W}:\${LON_E}" "\${LAT_S}:\${LAT_N}" "\$local_filtered" >/dev/null 2>&1; then
     echo "  WARNING: wgrib2 crop failed on \${out_prefix}" >&2
     rm -f "\$local_raw"
@@ -243,4 +247,4 @@ echo "Done. Output: ${output_file}"
 echo "  Cycle: ${found_date} ${found_hour}z"
 echo "  Subhour (15-min): ${#filtered_files[@]} of ${SUBH_MAX_HOUR} forecast hours ($(wgrib2 "$output_file" 2>/dev/null | grep -c ':d=' || echo '?') messages)"
 echo "  Variables: UGRD 10m, VGRD 10m, GUST, MSLET, APCP"
-echo "  Region: Lake Michigan (${LAT_S}-${LAT_N}N, $((360 - LON_E))-$((360 - LON_W))W)"
+echo "  Region: Annapolis race area (${LAT_S}-${LAT_N}N, 76.15-76.65W)"
