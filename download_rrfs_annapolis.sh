@@ -11,11 +11,15 @@ PRODUCT="2dfld"
 DOMAIN="conus"
 RESOLUTION="3km"
 
-# Lake Michigan bounding box (lon must be 0-360 for wgrib2 -small_grib)
-LON_W=$((360 - 88))   # 87.8W ~ 272
-LON_E=$((360 - 85))   # 85.5W ~ 275
-LAT_S="41.6"
-LAT_N="46.1"
+# Annapolis race area bounding box (lon must be 0-360 for wgrib2 -small_grib)
+# Covers the AYC Bay Circle (off the Severn River mouth), the Inside Circle off
+# Chesapeake Harbor, and every Region 3 government mark in SI Attachment 3
+# (K 38.75N to D 38.99N, F 76.32W to T/Y 76.47W), padded ~10 km so the 3 km
+# grid has context around the course.
+LON_W="283.35"   # 76.65W
+LON_E="283.85"   # 76.15W
+LAT_S="38.6"
+LAT_N="39.1"
 
 IDX_MATCH=":(UGRD:10 m above ground|VGRD:10 m above ground|GUST:surface|MSLET:mean sea level|APCP:surface):"
 
@@ -33,6 +37,8 @@ TMPDIR_BASE="${OUTDIR}/.rrfs_tmp_$$"
 
 mkdir -p "$OUTDIR"
 
+MAIN_CYCLES=(0 6 12 18)
+MAIN_MAX_HOUR=84
 SUBH_MAX_HOUR=18
 
 cleanup() {
@@ -50,25 +56,40 @@ for cmd in wgrib2 curl; do
     fi
 done
 
-# --- Determine latest complete cycle (any cycle hour) ---
-echo "Searching for latest complete forecast cycle..."
+# --- Determine latest complete main cycle ---
+echo "Searching for latest complete main forecast cycle..."
 
 now_utc=$(date -u +%s)
 found_cycle=""
 found_date=""
 found_hour=""
 
-for offset in $(seq 0 24); do
+for offset in $(seq 0 48); do
     check_time=$((now_utc - offset * 3600))
     check_date=$(date -u -r "$check_time" +%Y%m%d)
     check_hour=$(date -u -r "$check_time" +%H)
+    cycle_int=$((10#$check_hour))
 
-    # Check that subhour f018 exists via HTTP HEAD
+    # Only check main cycle hours
+    is_main=0
+    for mc in "${MAIN_CYCLES[@]}"; do
+        if (( cycle_int == mc )); then
+            is_main=1
+            break
+        fi
+    done
+    if (( ! is_main )); then
+        continue
+    fi
+
+    # Check both: subhour f018 and regular f084 must exist via HTTP HEAD
     subh_final_url="${NOMADS_BASE}/rrfs.${check_date}/${check_hour}/rrfs.t${check_hour}z.${PRODUCT}.${RESOLUTION}.subh.f$(printf '%03d' $SUBH_MAX_HOUR).${DOMAIN}.grib2"
+    reg_final_url="${NOMADS_BASE}/rrfs.${check_date}/${check_hour}/rrfs.t${check_hour}z.${PRODUCT}.${RESOLUTION}.f$(printf '%03d' $MAIN_MAX_HOUR).${DOMAIN}.grib2"
 
     echo "  Checking cycle ${check_date}/${check_hour}z..."
 
-    if curl --http1.1 -sf --connect-timeout 15 --max-time 30 --head "$subh_final_url" &>/dev/null; then
+    if curl --http1.1 -sf --connect-timeout 15 --max-time 30 --head "$subh_final_url" &>/dev/null && \
+       curl --http1.1 -sf --connect-timeout 15 --max-time 30 --head "$reg_final_url" &>/dev/null; then
         found_cycle="${check_date}/${check_hour}"
         found_date="$check_date"
         found_hour="$check_hour"
@@ -78,12 +99,12 @@ for offset in $(seq 0 24); do
 done
 
 if [[ -z "$found_cycle" ]]; then
-    echo "ERROR: Could not find a complete forecast cycle in the last 24 hours." >&2
+    echo "ERROR: Could not find a complete main forecast cycle in the last 48 hours." >&2
     exit 1
 fi
 
 # --- Download, filter, and crop ---
-output_file="${OUTDIR}/rrfs_hourly_lake_michigan_${found_date}_${found_hour}z.grib2"
+output_file="${OUTDIR}/rrfs_annapolis_${found_date}_${found_hour}z.grib2"
 
 if [[ -f "$output_file" ]]; then
     echo "Output file already exists: ${output_file}"
@@ -168,7 +189,7 @@ fi
 # Fetch every range in ONE request. Apache answers with multipart/byteranges;
 # wgrib2 scans for the GRIB magic and skips the MIME boundaries, so the body
 # can be handed to it as-is. This is 1 request per forecast hour instead of one
-# per variable -- the difference between ~380 and ~36 requests per run, which is
+# per variable -- the difference between ~780 and ~170 requests per run, which is
 # what was tripping NOMADS' rate limiter.
 range_header=\$(IFS=,; echo "\${offsets[*]}")
 
@@ -186,7 +207,7 @@ if (( got != \${#offsets[@]} )); then
     exit 1
 fi
 
-# Crop to Lake Michigan bounding box
+# Crop to Annapolis race area bounding box
 if ! wgrib2 "\$local_raw" -small_grib "\${LON_W}:\${LON_E}" "\${LAT_S}:\${LAT_N}" "\$local_filtered" >/dev/null 2>&1; then
     echo "  WARNING: wgrib2 crop failed on \${out_prefix}" >&2
     rm -f "\$local_raw"
@@ -198,20 +219,35 @@ WORKER_EOF
 chmod +x "$WORKER"
 
 echo "Downloading and processing..."
-echo "  f001-f018 (subhour, 15-min resolution)"
+echo "  Phase 1: f000 (regular hourly)"
+echo "  Phase 2: f001-f018 (subhour, 15-min resolution)"
+echo "  Phase 3: f019-f084 (regular hourly)"
 echo "  Using byte-range downloads with ${MAX_PARALLEL} parallel jobs..."
 
-# f001-f018 from subhour product (parallel)
+# Phase 1: f000 from regular product. Don't let one bad hour abort the run.
+failed=0
+file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.f000.${DOMAIN}.grib2"
+"$WORKER" "$file_url" "000_reg_f000" || failed=1
+
+# Phase 2: f001-f018 from subhour product (parallel)
 for i in $(seq 1 "$SUBH_MAX_HOUR"); do
     fhr_str=$(printf "f%03d" "$i")
     seq_num=$(printf "%03d" "$i")
     file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.subh.${fhr_str}.${DOMAIN}.grib2"
     echo "${file_url} ${seq_num}_subh_${fhr_str}"
-done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER" || xargs_status=$?
+done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER" || failed=1
+
+# Phase 3: f019-f084 from regular product (parallel)
+for i in $(seq 19 "$MAIN_MAX_HOUR"); do
+    fhr_str=$(printf "f%03d" "$i")
+    seq_num=$(printf "%03d" "$i")
+    file_url="${NOMADS_BASE}/rrfs.${found_date}/${found_hour}/rrfs.t${found_hour}z.${PRODUCT}.${RESOLUTION}.${fhr_str}.${DOMAIN}.grib2"
+    echo "${file_url} ${seq_num}_reg_${fhr_str}"
+done | xargs -P "$MAX_PARALLEL" -L1 "$WORKER" || failed=1
 
 # xargs exits 123 when any worker failed. Don't let `set -e` abort here -- report
 # the shortfall below and still merge whatever did succeed.
-if [[ -n "${xargs_status:-}" ]]; then
+if (( failed )); then
     echo "  NOTE: one or more forecast hours failed (see warnings above)."
 fi
 
@@ -229,18 +265,20 @@ if (( ${#filtered_files[@]} == 0 )); then
     exit 1
 fi
 
-if (( ${#filtered_files[@]} < SUBH_MAX_HOUR )); then
-    echo "  WARNING: only ${#filtered_files[@]} of ${SUBH_MAX_HOUR} forecast hours succeeded." >&2
+expected_files=$(( 1 + SUBH_MAX_HOUR + (MAIN_MAX_HOUR - 19 + 1) ))
+if (( ${#filtered_files[@]} < expected_files )); then
+    echo "  WARNING: only ${#filtered_files[@]} of ${expected_files} forecast hours succeeded." >&2
     echo "           Output will have gaps. Re-run to fill them." >&2
 fi
 
-# Sort to ensure proper ordering (001_subh_f001..018_subh_f018)
+# Sort to ensure proper ordering (000_reg_f000, 001_subh_f001..018_subh_f018, 019_reg_f019..084_reg_f084)
 IFS=$'\n' sorted_files=($(printf '%s\n' "${filtered_files[@]}" | sort)); unset IFS
 
 cat "${sorted_files[@]}" > "$output_file"
 
 echo "Done. Output: ${output_file}"
 echo "  Cycle: ${found_date} ${found_hour}z"
-echo "  Subhour (15-min): ${#filtered_files[@]} of ${SUBH_MAX_HOUR} forecast hours ($(wgrib2 "$output_file" 2>/dev/null | grep -c ':d=' || echo '?') messages)"
+echo "  Forecast hours: ${#filtered_files[@]} of ${expected_files} ($(wgrib2 "$output_file" 2>/dev/null | grep -c ':d=' || echo '?') messages)"
+echo "  Subhour (15-min): f001-f018 | Hourly: f000, f019-f084"
 echo "  Variables: UGRD 10m, VGRD 10m, GUST, MSLET, APCP"
-echo "  Region: Lake Michigan (${LAT_S}-${LAT_N}N, $((360 - LON_E))-$((360 - LON_W))W)"
+echo "  Region: Annapolis race area (${LAT_S}-${LAT_N}N, 76.15-76.65W)"

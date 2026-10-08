@@ -1,12 +1,12 @@
 # RRFS GRIB Download
 
-Scripts for downloading RRFS (Rapid Refresh Forecast System) weather data from NOAA NOMADS, filtered and cropped to the Lake Michigan region.
+Scripts for downloading RRFS (Rapid Refresh Forecast System) weather data from NOAA NOMADS, filtered and cropped to a regional bounding box. There are two pairs of scripts: one for Lake Michigan and one for the Annapolis, MD race area on the Chesapeake Bay.
 
 ## Data source
 
 Data comes from NOMADS at `https://nomads.ncep.noaa.gov/pub/data/nccf/com/rrfs`, using the `2dfld` product on the 3 km CONUS grid.
 
-RRFS is still in parallel testing, so the scripts pick the directory by date: `para` before **2026-10-06** and `prod` from that date onward. Adjust the cutover date at the top of each script if NOAA's schedule shifts.
+RRFS is still in parallel testing, so the scripts pick the directory by date: `para` before **2026-10-06** and `v1.0` (the operational path) from that date onward. Adjust the cutover date at the top of each script if NOAA's schedule shifts.
 
 ## Scripts
 
@@ -26,6 +26,10 @@ Downloads a shorter forecast from the latest complete cycle. RRFS runs hourly, s
 
 Note this script does *not* include f000; it starts at f001.
 
+### `download_rrfs_annapolis.sh` / `download_rrfs_hourly_annapolis.sh`
+
+Identical to the two Lake Michigan scripts above (same cycles, forecast hours, and variables), but cropped to the Annapolis race area instead.
+
 ### Variables downloaded
 
 | Variable | Description |
@@ -38,11 +42,17 @@ Note this script does *not* include f000; it starts at f001.
 
 Two APCP caveats when counting messages: the regular (non-subhourly) files carry **two** APCP records per forecast hour — a 1-hour bucket and a run-total — while f000 carries **none**, since nothing has accumulated at analysis time.
 
-### Region
+### Regions
 
 Lake Michigan bounding box:
 - Latitude: 41.6N - 46.1N
 - Longitude: 85W - 88W
+
+Annapolis race area bounding box:
+- Latitude: 38.6N - 39.1N
+- Longitude: 76.15W - 76.65W
+
+The Annapolis box covers the Annapolis Yacht Club Bay Circle (off the mouth of the Severn River), the Inside Circle off Chesapeake Harbor, and every CBYRA Region 3 government mark used for the Bay course (marks K through D, roughly 38.75N-38.99N and 76.32W-76.47W). It is padded about 10 km on each side. The crop comes out to an 18 x 22 grid.
 
 ## Dependencies
 
@@ -139,6 +149,10 @@ wgrib2 --version
 
 # Short 18-hour forecast (any hourly cycle, more frequent updates)
 ./download_rrfs_hourly_lake_michigan.sh
+
+# Same two, for the Annapolis race area
+./download_rrfs_annapolis.sh
+./download_rrfs_hourly_annapolis.sh
 ```
 
 Output files are written to `./output/` with naming like:
@@ -146,13 +160,15 @@ Output files are written to `./output/` with naming like:
 ```
 output/rrfs_lake_michigan_20260722_12z.grib2
 output/rrfs_hourly_lake_michigan_20260722_15z.grib2
+output/rrfs_annapolis_20261008_12z.grib2
+output/rrfs_hourly_annapolis_20261008_15z.grib2
 ```
 
 The scripts:
 1. Find the latest complete forecast cycle on NOMADS
 2. Read each forecast hour's `.idx` file to locate the byte ranges for the variables above
 3. Fetch all of those ranges in a **single** multi-range HTTP request per forecast hour
-4. Crop each forecast hour to the Lake Michigan bounding box
+4. Crop each forecast hour to the region's bounding box
 5. Merge all hours into a single output GRIB2 file
 
 Step 3 matters for staying under NOMADS' rate limits. NOMADS' Apache honors multi-range requests and answers with `multipart/byteranges`; wgrib2 scans for the `GRIB` magic bytes, so it skips the MIME boundaries and the response can be handed to it as-is. That makes a run cost two requests per forecast hour (one `.idx`, one data) instead of one request per variable — 36 requests for the hourly script and 170 for the full one.
@@ -191,6 +207,6 @@ wgrib2 "$F" | grep -c ':d='
 # Per-variable breakdown (full script: 139 each of GUST/MSLET/UGRD/VGRD, 204 APCP)
 wgrib2 "$F" | awk -F: '{print $4}' | sort | uniq -c
 
-# Verify the crop actually applied -- expect Lambert Conformal 100 x 176
+# Verify the crop actually applied -- expect Lambert Conformal 100 x 176 (Annapolis: 18 x 22)
 wgrib2 -grid "$F" | head -3
 ```

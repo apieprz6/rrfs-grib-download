@@ -3,7 +3,7 @@ set -euo pipefail
 
 NOMADS_BASE="https://nomads.ncep.noaa.gov/pub/data/nccf/com/rrfs"
 if [[ $(date -u +%Y%m%d) -ge 20261006 ]]; then
-    NOMADS_BASE="${NOMADS_BASE}/prod"
+    NOMADS_BASE="${NOMADS_BASE}/v1.0"
 else
     NOMADS_BASE="${NOMADS_BASE}/para"
 fi
